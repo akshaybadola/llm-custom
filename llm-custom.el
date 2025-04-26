@@ -1,4 +1,4 @@
-;;; llm-custom.el --- Custom llm module -*- lexical-binding: t
+;;; llm-custom-el --- Custom LLM implementation -*- lexical-binding: t -*-
 
 ;; Copyright (c) 2023-2025  Free Software Foundation, Inc.
 
@@ -234,16 +234,56 @@ image data with `base64-encode-string'."
                         (buffer-string))))
     `(:images ,(llm-custom--img-list-to-base64 (reverse imgs)) :text ,new-content)))
 
-;; NOTE: Build messages implementation
-;;       1. If new message, first reset context.
-;;          - Also maybe save context to a variable
-;;       2. Get the last message only
-;;       3. Extract images and format the message
-;;       4. Send
+(defun llm-custom--process-file-links (content)
+  "Process file links in markdown CONTENT.
+
+Replace each file link with its text
+
+Only text files are supported."
+  (with-temp-buffer
+    (insert content)
+    (goto-char (point-min))
+    (while (re-search-forward "\\(?:\\[.*]\\)?(\\(?:file:/*\\)\\(.+?\\))\\|<\\(?:file:/*\\)\\(.+?\\)>" nil t)
+      (let* ((fname (concat "/" (string-remove-prefix "/" (or (match-string 1) (match-string 2)))))
+             (buf (get-file-buffer fname)))
+        (if buf
+            (replace-match (with-current-buffer buf
+                             (buffer-substring-no-properties (point-min) (point-max)))
+                           nil t)
+          (setq buf (find-file-noselect fname))
+          (replace-match (with-current-buffer buf (buffer-string)))
+          (kill-buffer buf))))
+    (buffer-string)))
+
+(defvar llm-custom-text-only-flag nil
+  "Send request text only to the service.
+Used for debugging as `llama-server' does not recognize `images'.")
+
+(defvar llm-custom-reset-context-flag nil
+  "Flag to send reset context with request in `llm-chat-streaming'.
+This is reset after being called once by `llm-custom--build-messages'.")
+
+(defvar llm-custom-full-interactions-flag nil
+  "Flag to send full interactions to `llm-chat-streaming'.
+This is reset after being called once by `llm-custom--build-messages'.")
+
 (defun llm-custom--build-messages (prompt)
-  "Build the :messages field based on interactions in PROMPT."
+  "Build the :messages field based on interactions in PROMPT.
+
+Build messages implementation
+1. If new message, add reset context field.
+   - TODO Also maybe save context to a variable
+2. Get the last message only
+   - Unless the flag to send the entire thing is set
+3. Extract images and format the message
+4. Send
+"
   (let ((interactions (llm-chat-prompt-interactions prompt)))
     (list
+     :reset (if (or llm-custom-reset-context-flag
+                    (progn (setq llm-custom-reset-context-flag nil)
+                           (= (length interactions) 1)))
+                t nil)
      :messages
      (vconcat
       (mapcan
@@ -255,16 +295,92 @@ image data with `base64-encode-string'."
             (let ((msg-plist
                    (list :role (symbol-name (llm-chat-prompt-interaction-role interaction)))))
               (when-let ((content (llm-chat-prompt-interaction-content interaction)))
-                (if (and (consp content)
-                         (llm-provider-utils-tool-use-p (car content)))
-                    (setq msg-plist
-                          (plist-put msg-plist :tool_calls
-                                     (llm-custom--build-tool-uses content)))
+                (when (and (consp content)
+                           (llm-provider-utils-tool-use-p (car content)))
                   (setq msg-plist
-                        (plist-put msg-plist :content
-                                   (llm-custom--process-images content)))))
+                        (plist-put msg-plist :tool_calls
+                                   (llm-custom--build-tool-uses content))))
+                (setq msg-plist
+                      (plist-put msg-plist :content
+                                 (llm-custom--process-images content)))
+                (let ((content-text (llm-custom--process-file-links
+                                     (plist-get-in msg-plist :content :text))))
+                  (if llm-custom-text-only-flag
+                      (setf (plist-get msg-plist :content) content-text)
+                    (setf (plist-get (plist-get msg-plist :content) :text) content-text))))
               msg-plist))))
-       `(,(-last-item interactions)))))))
+       (if llm-custom-full-interactions-flag
+           (progn
+             (setq llm-custom-full-interactions-flag nil)
+             interactions)
+         `(,(-last-item interactions))))))))
+
+
+(setq llm-custom-current-result nil
+      llm-custom-partial-callback nil
+      llm-custom-response-callback nil
+      llm-custom-error-callback nil
+      llm-custom-buf nil
+      llm-custom-multi-output nil
+      llm-custom-provider nil
+      llm-custom-prompt nil)
+
+
+(defvar llm-custom-current-result nil
+  "Variable to store the raw llm output.")
+
+(defun llm-custom-chat-streaming (provider prompt partial-callback
+                                           response-callback error-callback &optional multi-output)
+  (llm-provider-request-prelude provider)
+  (setq llm-custom-current-result nil
+        llm-custom-partial-callback partial-callback
+        llm-custom-response-callback response-callback
+        llm-custom-error-callback error-callback
+        llm-custom-buf (current-buffer)
+        llm-custom-multi-output multi-output
+        llm-custom-provider provider
+        llm-custom-prompt prompt)
+  (llm-request-plz-async
+   (llm-provider-chat-streaming-url provider)
+   :headers (llm-provider-headers provider)
+   :data (llm-provider-chat-request provider prompt t)
+   :media-type (llm-provider-streaming-media-handler
+                provider
+                (lambda (s)
+                  (setq llm-custom-current-result
+                        (llm-provider-utils-streaming-accumulate llm-custom-current-result s))
+                  (when llm-custom-partial-callback
+                    (llm-provider-utils-callback-in-buffer
+                     llm-custom-buf llm-custom-partial-callback (if llm-custom-multi-output
+                                                            llm-custom-current-result
+                                                          (plist-get llm-custom-current-result :text)))))
+                (lambda (err)
+                  (llm-provider-utils-callback-in-buffer
+                   llm-custom-buf error-callback 'error
+                   err)))
+   :on-success
+   (lambda (_)
+     ;; We don't need the data at the end of streaming, so we can ignore it.
+     (llm-provider-utils-process-result
+      llm-custom-provider llm-custom-prompt
+      (llm-provider-utils-streaming-accumulate
+       llm-custom-current-result
+       (when-let ((tool-uses-raw (plist-get llm-custom-current-result
+                                            :tool-uses-raw)))
+         `(:tool-uses ,(llm-provider-collect-streaming-tool-uses
+                        llm-custom-provider tool-uses-raw))))
+      llm-custom-multi-output
+      (lambda (result)
+        (llm-provider-utils-callback-in-buffer
+         llm-custom-buf llm-custom-response-callback result))))
+   :on-error (lambda (_ data)
+               (llm-provider-utils-callback-in-buffer
+                llm-custom-buf llm-custom-error-callback 'error
+                (if (stringp data)
+                    data
+                  (or (llm-provider-chat-extract-error
+                       llm-custom-provider data)
+                      "Unknown error"))))))
 
 (defun llm-provider-merge-non-standard-params (non-standard-params request-plist)
   "Merge NON-STANDARD-PARAMS (alist) into REQUEST-PLIST."
@@ -278,7 +394,7 @@ image data with `base64-encode-string'."
 
 (cl-defmethod llm-provider-chat-request ((provider llm-custom) prompt streaming)
   "From PROMPT, create the chat request data to send.
-PROVIDER is the Open AI provider.
+PROVIDER is the Custom provider.
 STREAMING if non-nil, turn on response streaming."
   (llm-provider-utils-combine-to-system-prompt prompt llm-custom-example-prelude)
   (let ((non-standard-params (llm-chat-prompt-non-standard-params prompt))
