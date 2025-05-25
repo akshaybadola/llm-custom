@@ -31,10 +31,11 @@
 (require 'llm-models)
 (require 'json)
 (require 'plz)
+(require 'util/core "util-core")
 
 (defgroup llm-custom nil
-  "LLM implementation for Open AI."
-  :group 'llm)
+  "LLM implementation for custom gemma llama.cpp integration."
+  :group 'llm-custom)
 
 (defcustom llm-custom-example-prelude "Examples of how you should respond follow."
   "The prelude to use for examples in Open AI chat prompts."
@@ -109,7 +110,7 @@ PROVIDER is the Open AI provider struct."
   (llm-custom--url provider "embeddings"))
 
 (cl-defmethod llm-provider-chat-url ((provider llm-custom))
-  (llm-custom--url provider "chat/completions"))
+  (llm-custom--url provider "v1/chat/completions"))
 
 ;; (cl-defmethod llm-custom--url ((provider llm-custom-compatible) command)
 ;;   "Return the URL for COMMAND for PROVIDER."
@@ -227,12 +228,17 @@ image data with `base64-encode-string'."
          (new-content (with-temp-buffer
                         (insert content)
                         (goto-char (point-min))
-                        (while (re-search-forward "\\(!\\[img](.+?)\\)" nil t)
-                          (setq have-links t)
-                          (push (substring (match-string 1) 7 -1) imgs)
-                          (replace-match "<__image__>"))
+                        (while (re-search-forward
+                                (rx (opt "!") (regexp "\\[.+?]") (regexp "(\\(.+?\\))")) nil t)
+                          (let ((match-str (match-string 1)))
+                            (unless (and (string-match-p "^http.+" match-str)
+                                         (= (string-match-p "^http.+" match-str)  0))
+                              (push (string-remove-prefix "file://" (match-string 1)) imgs)
+                              (replace-match "<__image__>"))))
                         (buffer-string))))
-    `(:images ,(llm-custom--img-list-to-base64 (reverse imgs)) :text ,new-content)))
+    (list new-content (llm-custom--img-list-to-base64 (reverse imgs)))
+    ;; `(:images ,(llm-custom--img-list-to-base64 (reverse imgs)) :text ,new-content)
+    ))
 
 (defun llm-custom--process-file-links (content)
   "Process file links in markdown CONTENT.
@@ -245,19 +251,24 @@ Only text files are supported."
     (goto-char (point-min))
     (while (re-search-forward "\\(?:\\[.*]\\)?(\\(?:file:/*\\)\\(.+?\\))\\|<\\(?:file:/*\\)\\(.+?\\)>" nil t)
       (let* ((fname (concat "/" (string-remove-prefix "/" (or (match-string 1) (match-string 2)))))
-             (buf (get-file-buffer fname)))
+             (buf (get-file-buffer fname))
+             repl)
         (if buf
-            (replace-match (with-current-buffer buf
-                             (buffer-substring-no-properties (point-min) (point-max)))
-                           nil t)
-          (setq buf (find-file-noselect fname))
-          (replace-match (with-current-buffer buf (buffer-string)))
+            (progn (setq repl (with-current-buffer buf
+                                (buffer-substring-no-properties (point-min) (point-max))))
+                   (replace-match repl nil t))
+          (save-match-data
+            (setq buf (find-file-noselect fname))
+            (setq repl (with-current-buffer buf
+                         (buffer-substring-no-properties (point-min) (point-max)))))
+          (replace-match repl nil t)
           (kill-buffer buf))))
     (buffer-string)))
 
 (defvar llm-custom-text-only-flag nil
   "Send request text only to the service.
-Used for debugging as `llama-server' does not recognize `images'.")
+Used with text only models as `llama-server' does not recognize the
+`images' key in JSON.")
 
 (defvar llm-custom-reset-context-flag nil
   "Flag to send reset context with request in `llm-chat-streaming'.
@@ -267,7 +278,41 @@ This is reset after being called once by `llm-custom--build-messages'.")
   "Flag to send full interactions to `llm-chat-streaming'.
 This is reset after being called once by `llm-custom--build-messages'.")
 
-(defun llm-custom--build-messages (prompt)
+(defvar llm-custom-log-message-file nil
+  "Log messages to given file.
+Useful for debugging.")
+
+(defvar llm-custom-python "python"
+  "Python command to call `llm.py'.")
+
+(defvar llm-custom-image-data-format 'gemma
+  "Format for image data.
+Can be one of \\='gemma or \\='llama.")
+
+(eval-and-compile
+  (defvar llm-custom-python-file (concat
+                                  (file-name-directory
+                                   (or load-file-name (buffer-file-name)))
+                                  "llm.py")
+    "Python program to run for `llm-custom-python-chat-streaming'"))
+
+
+(defun llm-custom-modify-msg-plist (msg-plist text image-data &optional text-only)
+  "Modify plist according to the request data format."
+  (cond (text-only
+         (setf (plist-get msg-plist :content) text))
+        ((eq llm-custom-image-data-format 'gemma)
+         (setf (plist-get msg-plist :content)
+               `(:text ,text :images ,image-data)))
+        ((eq llm-custom-image-data-format 'llama)
+         (setf (plist-get msg-plist :content) text)
+         (setf (plist-get msg-plist :image_data) image-data))
+        (t (user-error "Unknown image data format")))
+  msg-plist)
+
+;; TODO: One big issue is, if the model was reset, and we ask something again
+;;       all the texts would need to be sent again. We have to keep track of that
+(defun llm-custom--build-messages (prompt &optional text-only)
   "Build the :messages field based on interactions in PROMPT.
 
 Build messages implementation
@@ -300,21 +345,15 @@ Build messages implementation
                   (setq msg-plist
                         (plist-put msg-plist :tool_calls
                                    (llm-custom--build-tool-uses content))))
-                (setq msg-plist
-                      (plist-put msg-plist :content
-                                 (llm-custom--process-images content)))
-                (let ((content-text (llm-custom--process-file-links
-                                     (plist-get-in msg-plist :content :text))))
-                  (if llm-custom-text-only-flag
-                      (setf (plist-get msg-plist :content) content-text)
-                    (setf (plist-get (plist-get msg-plist :content) :text) content-text))))
+                (pcase-let* ((`(,text ,image-data) (llm-custom--process-images content))
+                             (text (llm-custom--process-file-links text)))
+                  (setq msg-plist (llm-custom-modify-msg-plist msg-plist text image-data text-only))))
               msg-plist))))
        (if llm-custom-full-interactions-flag
            (progn
              (setq llm-custom-full-interactions-flag nil)
              interactions)
          `(,(-last-item interactions))))))))
-
 
 (setq llm-custom-current-result nil
       llm-custom-partial-callback nil
@@ -324,7 +363,6 @@ Build messages implementation
       llm-custom-multi-output nil
       llm-custom-provider nil
       llm-custom-prompt nil)
-
 
 (defvar llm-custom-current-result nil
   "Variable to store the raw llm output.")
@@ -352,8 +390,8 @@ Build messages implementation
                   (when llm-custom-partial-callback
                     (llm-provider-utils-callback-in-buffer
                      llm-custom-buf llm-custom-partial-callback (if llm-custom-multi-output
-                                                            llm-custom-current-result
-                                                          (plist-get llm-custom-current-result :text)))))
+                                                                    llm-custom-current-result
+                                                                  (plist-get llm-custom-current-result :text)))))
                 (lambda (err)
                   (llm-provider-utils-callback-in-buffer
                    llm-custom-buf error-callback 'error
@@ -382,6 +420,188 @@ Build messages implementation
                        llm-custom-provider data)
                       "Unknown error"))))))
 
+(defun llm-custom-convert-md-to-org-via-pandoc-server (text &optional to-md)
+  (let* ((url "http://localhost:3030")
+         (url-request-extra-headers
+          `(("Content-Type" . "application/json")))
+         (url-request-method "POST")
+         (data `((text . ,text)
+                 (from . ,(if to-md "org" "markdown"))
+                 (to . ,(if to-md "markdown" "org"))
+                 (ascii . t)))
+         (url-request-data
+          (encode-coding-string (json-encode data) 'utf-8)))
+    (with-current-buffer (url-retrieve-synchronously url)
+      (goto-char (point-min))
+      (forward-paragraph)
+      (string-trim (buffer-substring-no-properties (point) (point-max))))))
+
+(defun llm-custom-model-info ()
+  "Get custom local provider info."
+  (interactive)
+  (let ((url (url-join (llm-custom-url ellama-provider) "model_info")))
+    (message "%s" (json-read-from-string
+                   (util/url-buffer-string (url-retrieve-synchronously url))))))
+
+(defun llm-custom-generating-p ()
+  "Check if custom local provider is generating."
+  (interactive)
+  (let ((url (url-join (llm-custom-url ellama-provider) "is_generating")))
+    (message "%s" (json-read-from-string
+                   (util/url-buffer-string (url-retrieve-synchronously url))))))
+
+(defun llm-custom-reset ()
+  "Reset custom local provider."
+  (interactive)
+  (let ((url (url-join (llm-custom-url ellama-provider) "reset_context")))
+    (message "%s" (json-read-from-string
+                   (util/url-buffer-string (url-retrieve-synchronously url))))))
+
+(defun llm-custom-alive-p ()
+  "Check if custom local provider is alive."
+  (interactive)
+  (let ((url (url-join (llm-custom-url ellama-provider) "is_alive")))
+    (message "%s" (json-read-from-string
+                   (util/url-buffer-string (url-retrieve-synchronously url))))))
+
+(defun llm-custom-multimodal-p (model-name)
+  (string-match-p "gemma3\\|gemini" model-name))
+
+(defun llm-custom-local-model-p (url)
+  (string-match-p "localhost\\|192.168" url))
+
+(defun llm-custom-list-models ()
+  "List models available."
+  (interactive)
+  (let ((url (llm-custom-url ellama-provider)))
+    (message "%s" (json-read-from-string
+                   (util/url-buffer-string (url-retrieve-synchronously
+                    (url-join url "list_models")))))))
+
+(defun llm-custom-switch-model (model-name params provider)
+  "Switch model with given name MODEL-NAME and parameters PARAMS."
+  (let ((url (llm-custom-url provider)))
+    (when (llm-custom-local-model-p url)
+      (setf (llm-custom-chat-model provider) model-name)
+      (message "%s" (json-read-from-string
+                     (util/url-post-json-synchronously
+                      (url-join url "switch_model") params))))))
+
+(defun llm-custom-interrupt (&optional provider)
+  "Interrupt `llm-custom' chat in for provider in current buffer.
+
+If it's not a local model then, cancel buffer-local request."
+  (interactive)
+  (let* ((provider (or provider ellama-provider))
+         (url (llm-custom-url ellama-provider)))
+    (cond ((llm-custom-local-model-p url)
+           (if (string-match-p "gemma3" (llm-custom-chat-model ellama-provider))
+               (message "%s" (json-read-from-string
+                              (util/url-buffer-string
+                               (url-retrieve-synchronously
+                                (url-join url "interrupt")))))
+               (when (buffer-live-p
+                      (get-buffer
+                       (format "*llm-custom-python-%s*" (buffer-name (current-buffer)))))
+                 (kill-process
+                  (get-buffer-process
+                   (format "*llm-custom-python-%s*" (buffer-name (current-buffer))))))))
+          (t (with-current-buffer (current-buffer)
+               (ellama--cancel-current-request))))))
+
+(defvar llm-custom-python-current-result nil
+  "Alist of (buffer . current-result)")
+
+(defvar llm-custom-stderr-buffer "*llm-custom-stderr*"
+  "Buffer for stderr output for `llm-custom'.")
+
+(defun llm-custom-replace-non-ascii ()
+  (goto-char (point-min))
+  (while (re-search-forward
+          (concat "\342\\|\206\\|\222\\|\302\\|\240" "\\|"
+                  (string-join '("\360" "\237" "\247" "\252" "\234"
+                                 "\205" "\223" "\200" "\235"
+                                 "\224" "\201")
+                               "\\|"))
+          nil t)
+    (replace-match "")))
+
+(defun llm-custom-chat-sentinel-subr (buf assistant-nick)
+  (with-current-buffer buf
+    (let ((beg (save-excursion
+                 (re-search-backward (regexp-quote assistant-nick))
+                 (end-of-line)
+                 (forward-char)
+                 (insert "\n")
+                 (point))))
+      (replace-region-contents
+       beg (point-max)
+       (lambda ()
+         (replace-regexp-in-string
+          "\\$ \\(.+?\\) \\$" "$\\1$"
+          (replace-regexp-in-string
+           "=\\(.+?\\)=" "~\\1~"
+           (replace-regexp-in-string
+            "\\\\\\[\\(.+?\\)\\\\]" "$$\\1$$"
+            (replace-regexp-in-string
+             "\\\\(\\(.+?\\)\\\\)" "$\\1$"
+             (llm-custom-convert-md-to-org-via-pandoc-server
+              (alist-get buf llm-custom-python-current-result nil nil 'equal))))))))
+      (org-indent-region beg (point-max)))
+    (goto-char (point-max))
+    (insert "\n\n** User:\n")))
+
+(defun llm-custom-python-chat-streaming (provider prompt eos-filter &rest _args)
+  (llm-provider-request-prelude provider)
+  (with-temp-buffer
+    (insert (json-encode (llm-provider-chat-request provider prompt t)))
+    (write-file "/tmp/llm-custom-messages.json"))
+  (let* ((buf (current-buffer))
+         (buf-name (buffer-name buf))
+         (assistant-nick (save-excursion
+                           (org-back-to-heading)
+                           (buffer-substring-no-properties (pos-bol) (pos-eol))))
+         (proc (make-process
+                :name (format "*llm-custom-python-%s*" buf-name)
+                :buffer nil
+                :filter (lambda (_proc response)
+                          (setf (alist-get buf-name llm-custom-python-current-result nil nil 'equal)
+                                (llm-provider-utils-streaming-accumulate
+                                 (alist-get buf-name llm-custom-python-current-result nil nil 'equal) response))
+                          (with-current-buffer buf
+                            (if (string-match-p "\n" response)
+                              (replace-region-contents
+                               (pos-bol) (pos-eol)
+                               (lambda ()
+                                 (replace-regexp-in-string
+                                  "\\$ \\(.+?\\) \\$" "$\\1$"
+                                  (replace-regexp-in-string
+                                   "=\\(.+?\\)=" "~\\1~"
+                                   (replace-regexp-in-string
+                                    "\\\\\\[\\(.+?\\)\\\\]" "$$\\1$$"
+                                    (replace-regexp-in-string
+                                     "\\\\(\\(.+?\\)\\\\)" "$\\1$"
+                                     (funcall eos-filter
+                                              (concat (buffer-substring-no-properties (pos-bol) (pos-eol))
+                                                      response))))))))
+                              (goto-char (point-max))
+                              (insert response))))
+                :stderr llm-custom-stderr-buffer
+                :command (list
+                          llm-custom-python llm-custom-python-file
+                          (llm-provider-chat-streaming-url provider)
+                          "/tmp/llm-custom-messages.json")
+                :sentinel (lambda (_proc event)
+                            (llm-custom-chat-sentinel-subr buf-name assistant-nick)
+                            (message "Done %s" event)
+                            (with-current-buffer llm-custom-stderr-buffer
+                              (goto-char (point-max))
+                              (re-search-backward "{'choices.+" nil t)
+                              (json-read-from-string
+                               (replace-regexp-in-string
+                                "'" "\""
+                                (buffer-substring-no-properties (pos-bol) (pos-eol)))))))))))
+
 (defun llm-provider-merge-non-standard-params (non-standard-params request-plist)
   "Merge NON-STANDARD-PARAMS (alist) into REQUEST-PLIST."
   (dolist (param non-standard-params request-plist)
@@ -398,6 +618,7 @@ PROVIDER is the Custom provider.
 STREAMING if non-nil, turn on response streaming."
   (llm-provider-utils-combine-to-system-prompt prompt llm-custom-example-prelude)
   (let ((non-standard-params (llm-chat-prompt-non-standard-params prompt))
+        (text-only (not (llm-custom-multimodal-p (llm-custom-chat-model provider))))
         request-plist)
 
     ;; Combine all the parts
@@ -409,10 +630,18 @@ STREAMING if non-nil, turn on response streaming."
            (llm-custom--build-max-tokens prompt)
            (llm-custom--build-response-format prompt)
            (llm-custom--build-tools prompt)
-           (llm-custom--build-messages prompt)))
+           (llm-custom--build-messages prompt text-only)))
 
     ;; Merge non-standard params
     (setq request-plist (llm-provider-merge-non-standard-params non-standard-params request-plist))
+
+    (when llm-custom-log-message-file
+      (with-current-buffer (find-file-noselect llm-custom-log-message-file)
+        (goto-char (point-max))
+        (insert "\n\n")
+        (insert (json-encode request-plist))
+        (basic-save-buffer)
+        (kill-current-buffer)))
 
     ;; Return the final request plist
     request-plist))
