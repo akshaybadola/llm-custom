@@ -17,7 +17,8 @@ async def oai_compat(url, fname):
                     try:
                         temp = json.loads(chunk.decode().replace('\n', '', 1)[6:])
                         token = temp["choices"][0]["delta"]["content"]
-                        print(token, end="", flush=True)
+                        if token is not None:
+                            print(token, end="", flush=True)
                         if "usage" in temp:
                             print("usage: ", temp["usage"], file=sys.stderr, flush=True)
                     except Exception:

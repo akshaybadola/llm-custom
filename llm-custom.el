@@ -440,8 +440,9 @@ Build messages implementation
   "Get custom local provider info."
   (interactive)
   (let ((url (url-join (llm-custom-url ellama-provider) "model_info")))
-    (message "%s" (json-read-from-string
-                   (util/url-buffer-string (url-retrieve-synchronously url))))))
+    (message "%s" (yaml-encode
+                   (json-read-from-string
+                    (util/url-buffer-string (url-retrieve-synchronously url)))))))
 
 (defun llm-custom-generating-p ()
   "Check if custom local provider is generating."
@@ -470,13 +471,16 @@ Build messages implementation
 (defun llm-custom-local-model-p (url)
   (string-match-p "localhost\\|192.168" url))
 
-(defun llm-custom-list-models ()
+(defun llm-custom-list-models (&optional no-message)
   "List models available."
   (interactive)
-  (let ((url (llm-custom-url ellama-provider)))
-    (message "%s" (json-read-from-string
-                   (util/url-buffer-string (url-retrieve-synchronously
-                    (url-join url "list_models")))))))
+  (let* ((url (llm-custom-url ellama-provider))
+         (models (json-read-from-string
+                  (util/url-buffer-string (url-retrieve-synchronously
+                                           (url-join url "list_models"))))))
+    (if no-message
+        models
+      (message "%s" (string-join models "\n")))))
 
 (defun llm-custom-switch-model (model-name params provider)
   "Switch model with given name MODEL-NAME and parameters PARAMS."
@@ -493,38 +497,31 @@ Build messages implementation
 If it's not a local model then, cancel buffer-local request."
   (interactive)
   (let* ((provider (or provider ellama-provider))
-         (url (llm-custom-url ellama-provider)))
+         (url (llm-custom-url provider)))
     (cond ((llm-custom-local-model-p url)
            (if (string-match-p "gemma3" (llm-custom-chat-model ellama-provider))
                (message "%s" (json-read-from-string
                               (util/url-buffer-string
                                (url-retrieve-synchronously
                                 (url-join url "interrupt")))))
-               (when (buffer-live-p
-                      (get-buffer
-                       (format "*llm-custom-python-%s*" (buffer-name (current-buffer)))))
-                 (kill-process
-                  (get-buffer-process
-                   (format "*llm-custom-python-%s*" (buffer-name (current-buffer))))))))
+             (kill-process (a-get llm-custom-python-processes
+                                  (buffer-name (current-buffer))))))
           (t (with-current-buffer (current-buffer)
                (ellama--cancel-current-request))))))
 
 (defvar llm-custom-python-current-result nil
-  "Alist of (buffer . current-result)")
+  "Alist of '\\=(buffer . current-result)")
+
+(defvar llm-custom-python-processes nil
+  "Alist of '\\=(buffer . proc) python streaming processes")
 
 (defvar llm-custom-stderr-buffer "*llm-custom-stderr*"
   "Buffer for stderr output for `llm-custom'.")
 
 (defun llm-custom-replace-non-ascii ()
   (goto-char (point-min))
-  (while (re-search-forward
-          (concat "\342\\|\206\\|\222\\|\302\\|\240" "\\|"
-                  (string-join '("\360" "\237" "\247" "\252" "\234"
-                                 "\205" "\223" "\200" "\235"
-                                 "\224" "\201")
-                               "\\|"))
-          nil t)
-    (replace-match "")))
+  (while (re-search-forward "[^[:ascii:]]+" nil t)
+    (replace-match "\\1")))
 
 (defun llm-custom-chat-sentinel-subr (buf assistant-nick)
   (with-current-buffer buf
@@ -533,10 +530,14 @@ If it's not a local model then, cancel buffer-local request."
                  (end-of-line)
                  (forward-char)
                  (insert "\n")
-                 (point))))
-      (replace-region-contents
-       beg (point-max)
-       (lambda ()
+                 (point)))
+          (end (point-max)))
+      (delete-region beg end)
+      (goto-char beg)
+      (insert
+       (let ((org-str (llm-custom-convert-md-to-org-via-pandoc-server
+                       (alist-get buf llm-custom-python-current-result nil nil 'equal))))
+         (message "Got response from pandoc")
          (replace-regexp-in-string
           "\\$ \\(.+?\\) \\$" "$\\1$"
           (replace-regexp-in-string
@@ -544,14 +545,23 @@ If it's not a local model then, cancel buffer-local request."
            (replace-regexp-in-string
             "\\\\\\[\\(.+?\\)\\\\]" "$$\\1$$"
             (replace-regexp-in-string
-             "\\\\(\\(.+?\\)\\\\)" "$\\1$"
-             (llm-custom-convert-md-to-org-via-pandoc-server
-              (alist-get buf llm-custom-python-current-result nil nil 'equal))))))))
+             "\\\\(\\(.+?\\)\\\\)" "$\\1$" org-str))))))
+      (message "Replaced region contents")
       (org-indent-region beg (point-max)))
+    (llm-custom-replace-non-ascii)
     (goto-char (point-max))
     (insert "\n\n** User:\n")))
 
 (defun llm-custom-python-chat-streaming (provider prompt eos-filter &rest _args)
+  "Stream from llama service with a python program.
+
+The output from the python program is piped into the `current-buffer'.
+
+PROVIDER is an implementation of `llm-provider'.
+PROMPT is the parsed user prompt, comprising or all required messages.
+EOS-FILTER is a filter which is applied to the generated text each time
+a newline is encountered.
+Rest of the args are ignored."
   (llm-provider-request-prelude provider)
   (with-temp-buffer
     (insert (json-encode (llm-provider-chat-request provider prompt t)))
@@ -600,7 +610,8 @@ If it's not a local model then, cancel buffer-local request."
                               (json-read-from-string
                                (replace-regexp-in-string
                                 "'" "\""
-                                (buffer-substring-no-properties (pos-bol) (pos-eol)))))))))))
+                                (buffer-substring-no-properties (pos-bol) (pos-eol)))))))))
+    (setf (alist-get buf-name llm-custom-python-processes nil nil 'equal) proc)))
 
 (defun llm-provider-merge-non-standard-params (non-standard-params request-plist)
   "Merge NON-STANDARD-PARAMS (alist) into REQUEST-PLIST."
