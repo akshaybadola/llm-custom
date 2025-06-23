@@ -84,7 +84,7 @@ PROVIDER is the Open AI provider struct."
   nil)
 
 (cl-defmethod llm-custom--headers ((provider llm-custom))
-  (when-let ((key (llm-custom-key provider)))
+  (when-let* ((key (llm-custom-key provider)))
     ;; If the key is a function, call it.  The `auth-source' API uses functions
     ;; to wrap secrets and to obfuscate them in the Emacs heap.
     (when (functionp key)
@@ -243,26 +243,29 @@ image data with `base64-encode-string'."
 (defun llm-custom--process-file-links (content)
   "Process file links in markdown CONTENT.
 
-Replace each file link with its text
+Replace each file link with its text formatted for the file type.  For
+source code, appropriate source blocks are inserted, otherwise the text
+is quoted.
 
 Only text files are supported."
   (with-temp-buffer
     (insert content)
     (goto-char (point-min))
     (while (re-search-forward "\\(?:\\[.*]\\)?(\\(?:file:/*\\)\\(.+?\\))\\|<\\(?:file:/*\\)\\(.+?\\)>" nil t)
-      (let* ((fname (concat "/" (string-remove-prefix "/" (or (match-string 1) (match-string 2)))))
-             (buf (get-file-buffer fname))
-             repl)
-        (if buf
-            (progn (setq repl (with-current-buffer buf
-                                (buffer-substring-no-properties (point-min) (point-max))))
-                   (replace-match repl nil t))
-          (save-match-data
-            (setq buf (find-file-noselect fname))
-            (setq repl (with-current-buffer buf
-                         (buffer-substring-no-properties (point-min) (point-max)))))
-          (replace-match repl nil t)
-          (kill-buffer buf))))
+      (let ((repl (save-match-data
+                    (let* ((fname (concat "/" (string-remove-prefix "/" (or (match-string 1) (match-string 2)))))
+                           (mode (-first (lambda (x) (string-match-p (car x) fname)) auto-mode-alist))
+                           (is-src (and mode (provided-mode-derived-p (cdr mode) 'prog-mode)))
+                           (mode-name (and mode (car (split-string (symbol-name (cdr mode)) "-"))))
+                           (file-str (with-temp-buffer
+                                       (insert-file-contents fname)
+                                       (buffer-string))))
+                      (if is-src
+                          (format "```%s\n%s\n```" mode-name file-str)
+                        (string-join
+                         (mapcar (lambda (x) (concat "> " x)) (split-string file-str "\n"))
+                         "\n"))))))
+        (replace-match repl nil t)))
     (buffer-string)))
 
 (defvar llm-custom-text-only-flag nil
@@ -339,7 +342,7 @@ Build messages implementation
            (list
             (let ((msg-plist
                    (list :role (symbol-name (llm-chat-prompt-interaction-role interaction)))))
-              (when-let ((content (llm-chat-prompt-interaction-content interaction)))
+              (when-let* ((content (llm-chat-prompt-interaction-content interaction)))
                 (when (and (consp content)
                            (llm-provider-utils-tool-use-p (car content)))
                   (setq msg-plist
@@ -403,7 +406,7 @@ Build messages implementation
       llm-custom-provider llm-custom-prompt
       (llm-provider-utils-streaming-accumulate
        llm-custom-current-result
-       (when-let ((tool-uses-raw (plist-get llm-custom-current-result
+       (when-let* ((tool-uses-raw (plist-get llm-custom-current-result
                                             :tool-uses-raw)))
          `(:tool-uses ,(llm-provider-collect-streaming-tool-uses
                         llm-custom-provider tool-uses-raw))))
@@ -509,8 +512,13 @@ If it's not a local model then, cancel buffer-local request."
           (t (with-current-buffer (current-buffer)
                (ellama--cancel-current-request))))))
 
+(defvar llm-custom-python-combined-result nil
+  "Alist of '\\=(buffer . combined-result).
+'\\=combined-result is a list of text messages LLM has sent.")
+
 (defvar llm-custom-python-current-result nil
-  "Alist of '\\=(buffer . current-result)")
+  "Alist of '\\=(buffer . current-result).
+The current last text by LLM.")
 
 (defvar llm-custom-python-processes nil
   "Alist of '\\=(buffer . proc) python streaming processes")
@@ -523,7 +531,50 @@ If it's not a local model then, cancel buffer-local request."
   (while (re-search-forward "[^[:ascii:]]+" nil t)
     (replace-match "\\1")))
 
+;; FIXME: This does not handle newlines between braces
+(defun llm-custom-fix-latex (str)
+  "Fix latex from \\(\\), \\=\\[\\] to $, $$."
+  (thread-last
+    str
+    (replace-regexp-in-string
+     "\\$ \\(.+?\\) \\$" "$\\1$")
+    (replace-regexp-in-string
+     "\\\\\\[\\(.+?\\)\\\\]" "$$\\1$$")
+    (replace-regexp-in-string
+     "\\\\(\\(.+?\\)\\\\)" "$\\1$")))
+
+(defun llm-custom-replace-=-~ (str)
+  "Replace = with ~ in STR outside of special blocks."
+  (let ((case-fold-search t)
+        (begin-re "^[ \t]*#\\+begin.+$")
+        (end-re "^[ \t]*#\\+end.+$"))
+    (with-temp-buffer
+      (insert str)
+      (goto-char (point-min))
+      (let ((prev-char (point))
+            strs)
+        (while (re-search-forward begin-re nil t)
+          (push (replace-regexp-in-string
+                 "=\\(.+?\\)=" "~\\1~"
+                 (buffer-substring-no-properties prev-char (point)))
+                strs)
+          (setq prev-char (point))
+          (re-search-forward end-re)
+          (push (buffer-substring-no-properties prev-char (point)) strs)
+          (setq prev-char (point)))
+        (push (replace-regexp-in-string
+                 "=\\(.+?\\)=" "~\\1~"
+                 (buffer-substring-no-properties prev-char (point)))
+              strs)
+        (string-join (reverse strs))))))
+
 (defun llm-custom-chat-sentinel-subr (buf assistant-nick)
+  "Do final processing of the LLM text.
+
+BUF is relevant `ellama' buffer.
+ASSISTANT-NICK is the `ellama' assistant name."
+  (push (alist-get buf llm-custom-python-current-result nil nil 'equal)
+        (alist-get buf llm-custom-python-combined-result nil nil 'equal))
   (with-current-buffer buf
     (let ((beg (save-excursion
                  (re-search-backward (regexp-quote assistant-nick))
@@ -535,22 +586,16 @@ If it's not a local model then, cancel buffer-local request."
       (delete-region beg end)
       (goto-char beg)
       (insert
-       (let ((org-str (llm-custom-convert-md-to-org-via-pandoc-server
-                       (alist-get buf llm-custom-python-current-result nil nil 'equal))))
-         (message "Got response from pandoc")
-         (replace-regexp-in-string
-          "\\$ \\(.+?\\) \\$" "$\\1$"
-          (replace-regexp-in-string
-           "=\\(.+?\\)=" "~\\1~"
-           (replace-regexp-in-string
-            "\\\\\\[\\(.+?\\)\\\\]" "$$\\1$$"
-            (replace-regexp-in-string
-             "\\\\(\\(.+?\\)\\\\)" "$\\1$" org-str))))))
+       (llm-custom-replace-=-~
+        (let ((org-str (llm-custom-convert-md-to-org-via-pandoc-server
+                        (alist-get buf llm-custom-python-current-result nil nil 'equal))))
+          (message "Got response from pandoc")
+          (llm-custom-fix-latex org-str))))
       (message "Replaced region contents")
-      (org-indent-region beg (point-max)))
-    (llm-custom-replace-non-ascii)
-    (goto-char (point-max))
-    (insert "\n\n** User:\n")))
+      (org-indent-region beg (point-max))
+      (llm-custom-replace-non-ascii)
+      (goto-char (point-max))
+      (insert "\n\n** User:\n"))))
 
 (defun llm-custom-python-chat-streaming (provider prompt eos-filter &rest _args)
   "Stream from llama service with a python program.
@@ -566,6 +611,9 @@ Rest of the args are ignored."
   (with-temp-buffer
     (insert (json-encode (llm-provider-chat-request provider prompt t)))
     (write-file "/tmp/llm-custom-messages.json"))
+  (setf (alist-get (buffer-name (current-buffer))
+                   llm-custom-python-current-result nil nil 'equal)
+        nil)
   (let* ((buf (current-buffer))
          (buf-name (buffer-name buf))
          (assistant-nick (save-excursion
@@ -580,20 +628,13 @@ Rest of the args are ignored."
                                  (alist-get buf-name llm-custom-python-current-result nil nil 'equal) response))
                           (with-current-buffer buf
                             (if (string-match-p "\n" response)
-                              (replace-region-contents
-                               (pos-bol) (pos-eol)
-                               (lambda ()
-                                 (replace-regexp-in-string
-                                  "\\$ \\(.+?\\) \\$" "$\\1$"
-                                  (replace-regexp-in-string
-                                   "=\\(.+?\\)=" "~\\1~"
-                                   (replace-regexp-in-string
-                                    "\\\\\\[\\(.+?\\)\\\\]" "$$\\1$$"
-                                    (replace-regexp-in-string
-                                     "\\\\(\\(.+?\\)\\\\)" "$\\1$"
-                                     (funcall eos-filter
-                                              (concat (buffer-substring-no-properties (pos-bol) (pos-eol))
-                                                      response))))))))
+                                (replace-region-contents
+                                 (pos-bol) (pos-eol)
+                                 (lambda ()
+                                   (llm-custom-fix-latex
+                                    (funcall eos-filter
+                                             (concat (buffer-substring-no-properties (pos-bol) (pos-eol))
+                                                     response)))))
                               (goto-char (point-max))
                               (insert response))))
                 :stderr llm-custom-stderr-buffer
@@ -699,7 +740,7 @@ RESPONSE can be nil if the response is complete."
                     ,(lambda (event)
                        (let ((data (plz-event-source-event-data event)))
                          (unless (equal data "[DONE]")
-                           (when-let ((response (llm-custom--get-partial-chat-response
+                           (when-let* ((response (llm-custom--get-partial-chat-response
                                                  (json-parse-string data :object-type 'alist))))
                              (funcall receiver (if (stringp response)
                                                    (list :text response)
@@ -723,7 +764,7 @@ RESPONSE can be nil if the response is complete."
 
 (cl-defmethod llm-capabilities ((provider llm-custom))
   (append '(streaming embeddings tool-use streaming-tool-use json-response model-list)
-          (when-let ((model (llm-models-match (llm-custom-chat-model provider))))
+          (when-let* ((model (llm-models-match (llm-custom-chat-model provider))))
             (seq-intersection (llm-model-capabilities model)
                               '(image-input)))))
 
