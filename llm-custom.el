@@ -562,10 +562,12 @@ The current last text by LLM.")
           (re-search-forward end-re)
           (push (buffer-substring-no-properties prev-char (point)) strs)
           (setq prev-char (point)))
-        (push (replace-regexp-in-string
-                 "=\\(.+?\\)=" "~\\1~"
-                 (buffer-substring-no-properties prev-char (point)))
-              strs)
+        (if strs
+            (push (replace-regexp-in-string
+                   "=\\(.+?\\)=" "~\\1~"
+                   (buffer-substring-no-properties prev-char (point-max)))
+                  strs)
+          (push (buffer-substring-no-properties (point-min) (point-max)) strs))
         (string-join (reverse strs))))))
 
 (defun llm-custom-chat-sentinel-subr (buf assistant-nick)
