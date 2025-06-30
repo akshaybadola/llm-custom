@@ -31,6 +31,8 @@
 (require 'llm-models)
 (require 'json)
 (require 'plz)
+(require 'markdown-mode)
+(require 'yaml)
 (require 'util/core "util-core")
 
 (defgroup llm-custom nil
@@ -104,7 +106,7 @@ PROVIDER is the Open AI provider struct."
 ;;   "Return the URL for COMMAND for PROVIDER.")
 
 (cl-defmethod llm-custom--url ((provider llm-custom) command)
-  (url-join (llm-custom-url provider) command))
+  (util/url-join (llm-custom-url provider) command))
 
 (cl-defmethod llm-provider-embedding-url ((provider llm-custom) &optional _)
   (llm-custom--url provider "embeddings"))
@@ -227,18 +229,24 @@ image data with `base64-encode-string'."
   (let* (imgs
          (new-content (with-temp-buffer
                         (insert content)
+                        (markdown-mode)
                         (goto-char (point-min))
                         (while (re-search-forward
                                 (rx (opt "!") (regexp "\\[.+?]") (regexp "(\\(.+?\\))")) nil t)
-                          (let ((match-str (match-string 1)))
-                            (unless (and (string-match-p "^http.+" match-str)
-                                         (= (string-match-p "^http.+" match-str)  0))
-                              (push (string-remove-prefix "file://" (match-string 1)) imgs)
-                              (replace-match "<__image__>"))))
+                          (unless (markdown-code-block-at-point-p)
+                            (let ((quoted-p (save-match-data
+                                              (string-match-p
+                                               "^>"
+                                               (buffer-substring-no-properties (pos-bol) (pos-eol)))))
+                                  (match-str (match-string 1)))
+                              (unless (or quoted-p
+                                          (string-match-p "^http.+" match-str)
+                                          (= (string-match-p "^http.+" match-str)  0))
+                                (push (string-remove-prefix "file://" (match-string 1)) imgs)
+                                (replace-match "<__image__>")))))
                         (buffer-string))))
-    (list new-content (llm-custom--img-list-to-base64 (reverse imgs)))
-    ;; `(:images ,(llm-custom--img-list-to-base64 (reverse imgs)) :text ,new-content)
-    ))
+    ;;NOTE: Not sure why this is commented `(:images ,(llm-custom--img-list-to-base64 (reverse imgs)) :text ,new-content)
+    (list new-content (llm-custom--img-list-to-base64 (reverse imgs)))))
 
 (defun llm-custom--process-file-links (content)
   "Process file links in markdown CONTENT.
@@ -439,32 +447,28 @@ Build messages implementation
       (forward-paragraph)
       (string-trim (buffer-substring-no-properties (point) (point-max))))))
 
-(defun llm-custom-model-info ()
+(defun llm-custom-model-info (provider)
   "Get custom local provider info."
-  (interactive)
-  (let ((url (url-join (llm-custom-url ellama-provider) "model_info")))
+  (let ((url (util/url-join (llm-custom-url provider) "model_info")))
     (message "%s" (yaml-encode
                    (json-read-from-string
                     (util/url-buffer-string (url-retrieve-synchronously url)))))))
 
-(defun llm-custom-generating-p ()
+(defun llm-custom-generating-p (provider)
   "Check if custom local provider is generating."
-  (interactive)
-  (let ((url (url-join (llm-custom-url ellama-provider) "is_generating")))
+  (let ((url (util/url-join (llm-custom-url provider) "is_generating")))
     (message "%s" (json-read-from-string
                    (util/url-buffer-string (url-retrieve-synchronously url))))))
 
-(defun llm-custom-reset ()
+(defun llm-custom-reset (provider)
   "Reset custom local provider."
-  (interactive)
-  (let ((url (url-join (llm-custom-url ellama-provider) "reset_context")))
+  (let ((url (util/url-join (llm-custom-url provider) "reset_context")))
     (message "%s" (json-read-from-string
                    (util/url-buffer-string (url-retrieve-synchronously url))))))
 
-(defun llm-custom-alive-p ()
+(defun llm-custom-alive-p (provider)
   "Check if custom local provider is alive."
-  (interactive)
-  (let ((url (url-join (llm-custom-url ellama-provider) "is_alive")))
+  (let ((url (util/url-join (llm-custom-url provider) "is_alive")))
     (message "%s" (json-read-from-string
                    (util/url-buffer-string (url-retrieve-synchronously url))))))
 
@@ -474,13 +478,12 @@ Build messages implementation
 (defun llm-custom-local-model-p (url)
   (string-match-p "localhost\\|192.168" url))
 
-(defun llm-custom-list-models (&optional no-message)
+(defun llm-custom-list-models (provider &optional no-message)
   "List models available."
-  (interactive)
-  (let* ((url (llm-custom-url ellama-provider))
+  (let* ((url (llm-custom-url provider))
          (models (json-read-from-string
                   (util/url-buffer-string (url-retrieve-synchronously
-                                           (url-join url "list_models"))))))
+                                           (util/url-join url "list_models"))))))
     (if no-message
         models
       (message "%s" (string-join models "\n")))))
@@ -492,21 +495,19 @@ Build messages implementation
       (setf (llm-custom-chat-model provider) model-name)
       (message "%s" (json-read-from-string
                      (util/url-post-json-synchronously
-                      (url-join url "switch_model") params))))))
+                      (util/url-join url "switch_model") params))))))
 
-(defun llm-custom-interrupt (&optional provider)
+(defun llm-custom-interrupt (provider)
   "Interrupt `llm-custom' chat in for provider in current buffer.
 
 If it's not a local model then, cancel buffer-local request."
-  (interactive)
-  (let* ((provider (or provider ellama-provider))
-         (url (llm-custom-url provider)))
+  (let* ((url (llm-custom-url provider)))
     (cond ((llm-custom-local-model-p url)
-           (if (string-match-p "gemma3" (llm-custom-chat-model ellama-provider))
+           (if (string-match-p "gemma3" (llm-custom-chat-model provider))
                (message "%s" (json-read-from-string
                               (util/url-buffer-string
                                (url-retrieve-synchronously
-                                (url-join url "interrupt")))))
+                                (util/url-join url "interrupt")))))
              (kill-process (a-get llm-custom-python-processes
                                   (buffer-name (current-buffer))))))
           (t (with-current-buffer (current-buffer)
